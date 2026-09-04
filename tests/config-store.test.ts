@@ -310,3 +310,83 @@ test("config store falls back only keymaps when configured keymaps are invalid",
 	assert.match(result.notice?.text ?? "", DEFAULT_KEYMAPS_NOTICE_PATTERN);
 	await rm(dirname(path), { force: true, recursive: true });
 });
+
+test("config store atomically writes and preserves existing provider and model keys", async () => {
+	const path = await makeTempPath("pi-ask-config-preserve-keys-");
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(
+		path,
+		JSON.stringify(
+			{
+				schemaVersion: 5,
+				provider: "ollama",
+				model: "llama3",
+				answer: {
+					provider: "ollama",
+					model: "llama3",
+					extractionModels: [
+						{ provider: "ollama", id: "llama3" },
+						{ provider: "anthropic", id: "claude-3-7-sonnet" },
+					],
+				},
+				behaviour: {
+					autoSubmitWhenAnsweredWithoutNotes: false,
+					confirmDismissWhenDirty: true,
+					doublePressReviewShortcuts: true,
+					presentSingleAsMulti: false,
+					showFooterHints: true,
+				},
+				customTopLevelSetting: "preserve-me",
+			},
+			null,
+			2
+		)
+	);
+
+	const store = new AskConfigStore(path);
+	await store.ensureLoaded();
+
+	// Toggling a behaviour setting in the overlay
+	await store.save({
+		behaviour: {
+			...DEFAULT_ASK_CONFIG.behaviour,
+			showFooterHints: false,
+		},
+	});
+
+	const rawContent = await readFile(path, "utf-8");
+	const savedData = JSON.parse(rawContent);
+
+	assert.equal(savedData.provider, "ollama");
+	assert.equal(savedData.model, "llama3");
+	assert.equal(savedData.customTopLevelSetting, "preserve-me");
+	assert.equal(savedData.answer?.provider, "ollama");
+	assert.equal(savedData.answer?.model, "llama3");
+	assert.deepEqual(savedData.answer?.extractionModels, [
+		{ provider: "ollama", id: "llama3" },
+		{ provider: "anthropic", id: "claude-3-7-sonnet" },
+	]);
+	assert.equal(savedData.behaviour?.showFooterHints, false);
+
+	await rm(dirname(path), { force: true, recursive: true });
+});
+
+test("test environment is sandboxed and does not touch user agent dir", async () => {
+	const { getAskConfigBaseDir, getTestSandboxDir, isTestEnvironment } =
+		await import("../src/config/store.ts");
+
+	assert.equal(isTestEnvironment(), true);
+
+	const originalEnv = process.env.PI_CODING_AGENT_DIR;
+	delete process.env.PI_CODING_AGENT_DIR;
+
+	try {
+		const baseDir = getAskConfigBaseDir();
+		assert.equal(baseDir, getTestSandboxDir());
+		assert(baseDir.includes("pi-ask-test-sandbox-"));
+	} finally {
+		if (originalEnv !== undefined) {
+			process.env.PI_CODING_AGENT_DIR = originalEnv;
+		}
+	}
+});

@@ -1,5 +1,6 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
 
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -8,7 +9,12 @@ import {
 	toAskConfigFileV5,
 } from "./defaults.ts";
 import { AskConfigMigrationError, migrateAskConfig } from "./migrate.ts";
-import type { AskConfig } from "./schema.ts";
+import { CURRENT_ASK_CONFIG_SCHEMA_VERSION } from "./migrations/index.ts";
+import type {
+	AskAnswerModelPreference,
+	AskConfig,
+	AskConfigFileV5,
+} from "./schema.ts";
 
 const INVALID_CONFIG_NOTICE =
 	"Config was invalid or unsupported. Loaded defaults for this session and left the config file unchanged. Edit the config file or run /reload after fixing it.";
@@ -23,6 +29,30 @@ export interface AskConfigNotice {
 interface AskConfigLoadResult {
 	config: AskConfig;
 	notice?: AskConfigNotice;
+}
+
+export async function writeJsonFileAtomic(
+	filePath: string,
+	data: unknown
+): Promise<void> {
+	const content = JSON.stringify(data, null, 2).concat("\n");
+	const dir = dirname(filePath);
+	await mkdir(dir, { recursive: true });
+	const tempPath = join(
+		dir,
+		`.${basename(filePath)}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`
+	);
+	try {
+		await writeFile(tempPath, content, "utf-8");
+		await rename(tempPath, filePath);
+	} catch (error) {
+		try {
+			await rm(tempPath, { force: true });
+		} catch {
+			// ignore cleanup error
+		}
+		throw error;
+	}
 }
 
 export class AskConfigStore {
@@ -66,20 +96,21 @@ export class AskConfigStore {
 	}
 
 	async save(config: AskConfig | Partial<AskConfig>): Promise<AskConfig> {
-		const normalized = normalizeAskConfig(config);
-		const content = JSON.stringify(
-			toAskConfigFileV5(normalized),
-			null,
-			2
-		).concat("\n");
 		try {
-			await mkdir(dirname(this.configPath), { recursive: true });
-			await writeFile(this.configPath, content, "utf-8");
+			const rawContent = await this.readDiskConfig();
+			const existing = parseJsonObject(rawContent);
+			const merged = mergeConfigFileData(existing, config);
+
+			await writeJsonFileAtomic(this.configPath, merged);
+
+			const normalized = normalizeAskConfig(
+				merged as unknown as Partial<AskConfigFileV5>
+			);
+			this.setConfig(normalized);
+			return normalized;
 		} catch (error) {
 			throw createConfigSaveError(this.configPath, error);
 		}
-		this.setConfig(normalized);
-		return normalized;
 	}
 
 	setConfig(config: AskConfig): void {
@@ -165,10 +196,51 @@ export class AskConfigStore {
 }
 
 let askConfigStore: AskConfigStore | undefined;
+let testSandboxDir: string | undefined;
+
+export function isTestEnvironment(): boolean {
+	return (
+		process.env.NODE_ENV === "test" ||
+		process.env.PI_ASK_TEST === "1" ||
+		Boolean(process.env.NODE_TEST_CONTEXT) ||
+		process.execArgv.some((arg) => arg.includes("test")) ||
+		process.argv.some(
+			(arg) =>
+				arg.endsWith(".test.ts") ||
+				arg.endsWith(".test.js") ||
+				arg.includes("node:test")
+		)
+	);
+}
+
+export function getTestSandboxDir(): string {
+	if (!testSandboxDir) {
+		testSandboxDir = join(tmpdir(), `pi-ask-test-sandbox-${process.pid}`);
+	}
+	return testSandboxDir;
+}
+
+export function setTestSandboxDir(dir: string | undefined): void {
+	testSandboxDir = dir;
+}
+
+export function getAskConfigBaseDir(): string {
+	if (process.env.PI_CODING_AGENT_DIR) {
+		return process.env.PI_CODING_AGENT_DIR;
+	}
+	if (isTestEnvironment()) {
+		return getTestSandboxDir();
+	}
+	return getAgentDir();
+}
 
 export function getAskConfigStore(): AskConfigStore {
 	askConfigStore ??= new AskConfigStore();
 	return askConfigStore;
+}
+
+export function setAskConfigStore(store: AskConfigStore | undefined): void {
+	askConfigStore = store;
 }
 
 export function resetAskConfigStore(): void {
@@ -176,11 +248,165 @@ export function resetAskConfigStore(): void {
 }
 
 export function getAskConfigPath(): string {
-	return join(getAgentDir(), "extensions", "eko24ive-pi-ask.json");
+	return join(getAskConfigBaseDir(), "extensions", "eko24ive-pi-ask.json");
 }
 
 export function getLegacyAskConfigPaths(): string[] {
-	return [join(getAgentDir(), "eko24ive-pi-ask.json")];
+	return [join(getAskConfigBaseDir(), "eko24ive-pi-ask.json")];
+}
+
+function parseJsonObject(content: string | undefined): Record<string, unknown> {
+	if (content === undefined) {
+		return {};
+	}
+	const parsed = parseJson(content);
+	if (
+		parsed.ok &&
+		parsed.value &&
+		typeof parsed.value === "object" &&
+		!Array.isArray(parsed.value)
+	) {
+		return parsed.value as Record<string, unknown>;
+	}
+	return {};
+}
+
+function getRecord(value: unknown): Record<string, unknown> {
+	if (value && typeof value === "object" && !Array.isArray(value)) {
+		return value as Record<string, unknown>;
+	}
+	return {};
+}
+
+function mergeTopLevelKeys(
+	target: Record<string, unknown>,
+	source: AskConfig | Partial<AskConfig>
+): void {
+	for (const [key, value] of Object.entries(source)) {
+		if (
+			value !== undefined &&
+			![
+				"schemaVersion",
+				"answer",
+				"behaviour",
+				"keymaps",
+				"notifications",
+			].includes(key)
+		) {
+			target[key] = value;
+		}
+	}
+}
+
+function mergeBehaviour(
+	target: Record<string, unknown>,
+	behaviour?: Partial<AskConfig["behaviour"]>
+): void {
+	if (!behaviour) {
+		return;
+	}
+	const existing = getRecord(target.behaviour);
+	target.behaviour = {
+		...existing,
+		...behaviour,
+	};
+}
+
+function mergeNotifications(
+	target: Record<string, unknown>,
+	notifications?: Partial<AskConfig["notifications"]>
+): void {
+	if (!notifications) {
+		return;
+	}
+	const existing = getRecord(target.notifications);
+	target.notifications = {
+		...existing,
+		...(notifications.channels === undefined
+			? {}
+			: { channels: notifications.channels }),
+		...(notifications.enabled === undefined
+			? {}
+			: { enabled: notifications.enabled }),
+	};
+}
+
+function mergeKeymaps(
+	target: Record<string, unknown>,
+	keymaps?: Partial<AskConfig["keymaps"]>
+): void {
+	if (!keymaps) {
+		return;
+	}
+	const existing = getRecord(target.keymaps);
+	target.keymaps = {
+		...existing,
+		...keymaps,
+	};
+}
+
+function resolveAnswerModels(
+	existingModels: unknown,
+	configuredModels?: AskAnswerModelPreference[]
+): unknown[] | undefined {
+	if (configuredModels !== undefined) {
+		return configuredModels;
+	}
+	if (Array.isArray(existingModels) && existingModels.length > 0) {
+		return existingModels;
+	}
+	return;
+}
+
+function mergeAnswer(
+	target: Record<string, unknown>,
+	answer?: Partial<AskConfig["answer"]>
+): void {
+	if (!answer) {
+		return;
+	}
+	const existing = getRecord(target.answer);
+	const modelsToSave = resolveAnswerModels(
+		existing.extractionModels,
+		answer.extractionModels
+	);
+
+	target.answer = {
+		...existing,
+		...(modelsToSave === undefined ? {} : { extractionModels: modelsToSave }),
+		...(answer.extractionRetries === undefined
+			? {}
+			: { extractionRetries: answer.extractionRetries }),
+		...(answer.extractionTimeoutMs === undefined
+			? {}
+			: { extractionTimeoutMs: answer.extractionTimeoutMs }),
+	};
+}
+
+function mergeConfigFileData(
+	existing: Record<string, unknown>,
+	config: AskConfig | Partial<AskConfig>
+): Record<string, unknown> {
+	const data =
+		Object.keys(existing).length === 0
+			? (toAskConfigFileV5(normalizeAskConfig(config)) as Record<
+					string,
+					unknown
+				>)
+			: { ...existing };
+
+	data.schemaVersion = Math.max(
+		typeof data.schemaVersion === "number" ? data.schemaVersion : 0,
+		CURRENT_ASK_CONFIG_SCHEMA_VERSION
+	);
+
+	mergeTopLevelKeys(data, config);
+	mergeBehaviour(data, config.behaviour);
+	mergeNotifications(data, config.notifications);
+	mergeKeymaps(data, config.keymaps);
+	mergeAnswer(data, config.answer);
+
+	return data;
 }
 
 function createConfigSaveError(path: string, error: unknown): Error {

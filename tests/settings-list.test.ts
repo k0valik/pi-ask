@@ -37,6 +37,7 @@ function plainTheme() {
 
 function createList(
 	options: {
+		configPath?: string;
 		notice?: AskConfigNotice;
 		onClose?: () => void;
 		onSave?: (config: AskConfig) => Promise<AskConfig>;
@@ -49,7 +50,7 @@ function createList(
 			// test callback intentionally unused
 		});
 	return new AskSettingsList(plainTheme(), {
-		configPath: "/tmp/eko24ive-pi-ask.json",
+		configPath: options.configPath ?? "/tmp/eko24ive-pi-ask.json",
 		notice: options.notice,
 		onClose,
 		onSave: options.onSave ?? ((config) => Promise.resolve(config)),
@@ -242,4 +243,64 @@ test("settings list closes with configured keys and dispose idempotently", () =>
 	list.handleInput("\u0003");
 	list.dispose();
 	assert.equal(closed, 1);
+});
+
+test("settings list with config store preserves existing provider and model on disk when toggling a setting", async () => {
+	const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { AskConfigStore } = await import("../src/config/store.ts");
+
+	const root = await mkdtemp(join(tmpdir(), "pi-ask-settings-list-preserve-"));
+	const configPath = join(root, "eko24ive-pi-ask.json");
+
+	await writeFile(
+		configPath,
+		JSON.stringify(
+			{
+				schemaVersion: 5,
+				provider: "deepseek",
+				model: "deepseek-chat",
+				answer: {
+					provider: "deepseek",
+					model: "deepseek-chat",
+					extractionModels: [{ provider: "deepseek", id: "deepseek-chat" }],
+				},
+				behaviour: {
+					autoSubmitWhenAnsweredWithoutNotes: false,
+					confirmDismissWhenDirty: true,
+					doublePressReviewShortcuts: true,
+					presentSingleAsMulti: false,
+					showFooterHints: true,
+				},
+			},
+			null,
+			2
+		)
+	);
+
+	const store = new AskConfigStore(configPath);
+	const loaded = await store.ensureLoaded();
+
+	const list = createList({
+		configPath,
+		onSave: (nextConfig) => store.save(nextConfig),
+		savedConfig: loaded.config,
+	});
+
+	// Toggle first item (autoSubmitWhenAnsweredWithoutNotes) from false to true
+	list.handleInput(" ");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+
+	const savedJson = JSON.parse(await readFile(configPath, "utf-8"));
+	assert.equal(savedJson.provider, "deepseek");
+	assert.equal(savedJson.model, "deepseek-chat");
+	assert.equal(savedJson.answer?.provider, "deepseek");
+	assert.equal(savedJson.answer?.model, "deepseek-chat");
+	assert.deepEqual(savedJson.answer?.extractionModels, [
+		{ provider: "deepseek", id: "deepseek-chat" },
+	]);
+	assert.equal(savedJson.behaviour?.autoSubmitWhenAnsweredWithoutNotes, true);
+
+	await rm(root, { force: true, recursive: true });
 });
