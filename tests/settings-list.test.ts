@@ -3,7 +3,7 @@ import test from "node:test";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_ASK_CONFIG } from "../src/config/defaults.ts";
 import type { AskConfig } from "../src/config/schema.ts";
-import type { AskConfigNotice } from "../src/config/store.ts";
+import type { AskConfigNotice, AskConfigPatch } from "../src/config/store.ts";
 import { AskSettingsList } from "../src/ui/settings-list.ts";
 
 const savedConfig: AskConfig = {
@@ -40,7 +40,7 @@ function createList(
 		configPath?: string;
 		notice?: AskConfigNotice;
 		onClose?: () => void;
-		onSave?: (config: AskConfig) => Promise<AskConfig>;
+		onSave?: (config: AskConfig | AskConfigPatch) => Promise<AskConfig>;
 		savedConfig?: AskConfig;
 	} = {}
 ) {
@@ -49,12 +49,15 @@ function createList(
 		(() => {
 			// test callback intentionally unused
 		});
+	const baseConfig = options.savedConfig ?? savedConfig;
 	return new AskSettingsList(plainTheme(), {
 		configPath: options.configPath ?? "/tmp/eko24ive-pi-ask.json",
 		notice: options.notice,
 		onClose,
-		onSave: options.onSave ?? ((config) => Promise.resolve(config)),
-		savedConfig: options.savedConfig ?? savedConfig,
+		onSave:
+			options.onSave ??
+			((patch) => Promise.resolve({ ...baseConfig, ...patch } as AskConfig)),
+		savedConfig: baseConfig,
 		tui: {
 			requestRender() {
 				// no-op in tests
@@ -99,11 +102,11 @@ test("settings list stays within narrow render width", () => {
 });
 
 test("settings list saves behaviour changes immediately without success feedback", async () => {
-	let saved: AskConfig | undefined;
+	let saved: AskConfig | AskConfigPatch | undefined;
 	const list = createList({
 		onSave: (config) => {
 			saved = config;
-			return Promise.resolve(config);
+			return Promise.resolve({ ...savedConfig, ...config } as AskConfig);
 		},
 	});
 
@@ -111,11 +114,11 @@ test("settings list saves behaviour changes immediately without success feedback
 	await new Promise((resolve) => setImmediate(resolve));
 
 	const text = list.render(72).join("\n");
-	assert.equal(saved?.behaviour.autoSubmitWhenAnsweredWithoutNotes, true);
-	assert.equal(saved?.behaviour.confirmDismissWhenDirty, true);
-	assert.equal(saved?.behaviour.doublePressReviewShortcuts, true);
-	assert.equal(saved?.behaviour.presentSingleAsMulti, false);
-	assert.equal(saved?.behaviour.showFooterHints, true);
+	// Only the toggled slice is sent so unrelated disk sections cannot be
+	// clobbered by a stale in-memory copy.
+	assert.deepEqual(saved, {
+		behaviour: { autoSubmitWhenAnsweredWithoutNotes: true },
+	});
 	assert.equal(text.includes("Saved"), false);
 });
 
@@ -166,7 +169,7 @@ test("settings list clears load warnings after successful save", async () => {
 });
 
 test("settings list uses configured navigation and close keys", async () => {
-	let saved: AskConfig | undefined;
+	let saved: AskConfig | AskConfigPatch | undefined;
 	const customConfig: AskConfig = {
 		...savedConfig,
 		keymaps: {
@@ -183,7 +186,7 @@ test("settings list uses configured navigation and close keys", async () => {
 	const list = createList({
 		onSave: (config) => {
 			saved = config;
-			return Promise.resolve(config);
+			return Promise.resolve({ ...customConfig, ...config } as AskConfig);
 		},
 		savedConfig: customConfig,
 	});
@@ -192,12 +195,12 @@ test("settings list uses configured navigation and close keys", async () => {
 	list.handleInput("x");
 	await new Promise((resolve) => setImmediate(resolve));
 
-	assert.equal(saved?.behaviour.confirmDismissWhenDirty, false);
+	assert.equal(saved?.behaviour?.confirmDismissWhenDirty, false);
 });
 
 test("settings list resets config to defaults after double press", async () => {
 	let saveCount = 0;
-	let saved: AskConfig | undefined;
+	let saved: AskConfig | AskConfigPatch | undefined;
 	const customConfig: AskConfig = {
 		...savedConfig,
 		behaviour: {
@@ -214,7 +217,7 @@ test("settings list resets config to defaults after double press", async () => {
 		onSave: (config) => {
 			saveCount += 1;
 			saved = config;
-			return Promise.resolve(config);
+			return Promise.resolve({ ...customConfig, ...config } as AskConfig);
 		},
 		savedConfig: customConfig,
 	});
@@ -301,6 +304,64 @@ test("settings list with config store preserves existing provider and model on d
 		{ provider: "deepseek", id: "deepseek-chat" },
 	]);
 	assert.equal(savedJson.behaviour?.autoSubmitWhenAnsweredWithoutNotes, true);
+
+	await rm(root, { force: true, recursive: true });
+});
+
+test("settings list toggle preserves disk edits made after load", async () => {
+	const { mkdtemp, readFile, rm, writeFile } = await import("node:fs/promises");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { AskConfigStore } = await import("../src/config/store.ts");
+
+	const root = await mkdtemp(join(tmpdir(), "pi-ask-settings-list-stale-"));
+	const configPath = join(root, "eko24ive-pi-ask.json");
+	const initialModels = [{ provider: "ollama", id: "llama3" }];
+	const externalModels = [{ provider: "deepseek", id: "deepseek-chat" }];
+
+	await writeFile(
+		configPath,
+		JSON.stringify({
+			schemaVersion: 5,
+			answer: { extractionModels: initialModels },
+			behaviour: {
+				...DEFAULT_ASK_CONFIG.behaviour,
+				autoSubmitWhenAnsweredWithoutNotes: false,
+				showFooterHints: true,
+			},
+		})
+	);
+
+	const store = new AskConfigStore(configPath);
+	const loaded = await store.ensureLoaded();
+	const list = createList({
+		configPath,
+		onSave: (nextConfig) => store.save(nextConfig),
+		savedConfig: loaded.config,
+	});
+
+	// External edit after load: different models plus an unrelated flag flip.
+	await writeFile(
+		configPath,
+		JSON.stringify({
+			schemaVersion: 5,
+			answer: { extractionModels: externalModels },
+			behaviour: {
+				...DEFAULT_ASK_CONFIG.behaviour,
+				autoSubmitWhenAnsweredWithoutNotes: false,
+				showFooterHints: false,
+			},
+		})
+	);
+
+	// Toggle first item (autoSubmitWhenAnsweredWithoutNotes) from false to true.
+	list.handleInput(" ");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+
+	const savedJson = JSON.parse(await readFile(configPath, "utf-8"));
+	assert.deepEqual(savedJson.answer?.extractionModels, externalModels);
+	assert.equal(savedJson.behaviour?.autoSubmitWhenAnsweredWithoutNotes, true);
+	assert.equal(savedJson.behaviour?.showFooterHints, false);
 
 	await rm(root, { force: true, recursive: true });
 });

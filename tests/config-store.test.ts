@@ -371,6 +371,125 @@ test("config store atomically writes and preserves existing provider and model k
 	await rm(dirname(path), { force: true, recursive: true });
 });
 
+test("config store refuses to overwrite read-only files", {
+	skip: process.geteuid?.() === 0,
+}, async () => {
+	const { chmod } = await import("node:fs/promises");
+	const path = await makeTempPath("pi-ask-config-readonly-");
+	await mkdir(dirname(path), { recursive: true });
+	const original = JSON.stringify({
+		schemaVersion: 5,
+		behaviour: DEFAULT_ASK_CONFIG.behaviour,
+	});
+	await writeFile(path, original, "utf-8");
+	await chmod(path, 0o444);
+	const store = new AskConfigStore(path);
+	try {
+		await assert.rejects(
+			store.save({
+				behaviour: {
+					...DEFAULT_ASK_CONFIG.behaviour,
+					showFooterHints: false,
+				},
+			}),
+			SAVE_FAILURE_PATTERN
+		);
+		assert.equal(await readFile(path, "utf-8"), original);
+	} finally {
+		await chmod(path, 0o600);
+		await rm(dirname(path), { force: true, recursive: true });
+	}
+});
+
+test("config store keeps the original file mode on save", async () => {
+	const { chmod, stat } = await import("node:fs/promises");
+	const path = await makeTempPath("pi-ask-config-mode-");
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(
+		path,
+		JSON.stringify({
+			schemaVersion: 5,
+			behaviour: DEFAULT_ASK_CONFIG.behaviour,
+		})
+	);
+	await chmod(path, 0o600);
+	const store = new AskConfigStore(path);
+	await store.save({
+		behaviour: {
+			...DEFAULT_ASK_CONFIG.behaviour,
+			showFooterHints: false,
+		},
+	});
+	assert.equal((await stat(path)).mode % 0o1000, 0o600);
+	await rm(dirname(path), { force: true, recursive: true });
+});
+
+test("config store writes through symlinked configs instead of replacing the link", async () => {
+	const { lstat, mkdtemp, symlink } = await import("node:fs/promises");
+	const root = await mkdtemp(join(tmpdir(), "pi-ask-config-symlink-"));
+	const realPath = join(root, "real.json");
+	const linkPath = join(root, "link.json");
+	await writeFile(
+		realPath,
+		JSON.stringify({
+			schemaVersion: 5,
+			customTopLevelSetting: "preserve-me",
+			behaviour: DEFAULT_ASK_CONFIG.behaviour,
+		})
+	);
+	await symlink(realPath, linkPath);
+	const store = new AskConfigStore(linkPath);
+	await store.save({
+		behaviour: {
+			...DEFAULT_ASK_CONFIG.behaviour,
+			showFooterHints: false,
+		},
+	});
+
+	assert.equal((await lstat(linkPath)).isSymbolicLink(), true);
+	const savedData = JSON.parse(await readFile(realPath, "utf-8"));
+	assert.equal(savedData.customTopLevelSetting, "preserve-me");
+	assert.equal(savedData.behaviour?.showFooterHints, false);
+	await rm(root, { force: true, recursive: true });
+});
+
+test("config store preserves unknown nested keymap bindings", async () => {
+	const path = await makeTempPath("pi-ask-config-nested-keymaps-");
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(
+		path,
+		JSON.stringify({
+			schemaVersion: 5,
+			behaviour: DEFAULT_ASK_CONFIG.behaviour,
+			keymaps: {
+				...DEFAULT_ASK_CONFIG.keymaps,
+				main: {
+					...DEFAULT_ASK_CONFIG.keymaps.main,
+					customAction: ["f9"],
+				},
+			},
+			notifications: DEFAULT_ASK_CONFIG.notifications,
+		})
+	);
+	const store = new AskConfigStore(path);
+	await store.ensureLoaded();
+	await store.save({
+		behaviour: {
+			...DEFAULT_ASK_CONFIG.behaviour,
+			showFooterHints: false,
+		},
+	});
+
+	const savedData = JSON.parse(await readFile(path, "utf-8"));
+	assert.deepEqual(savedData.keymaps?.main?.customAction, ["f9"]);
+	assert.deepEqual(
+		savedData.keymaps?.main?.toggle,
+		DEFAULT_ASK_CONFIG.keymaps.main.toggle
+	);
+	assert.equal(savedData.behaviour?.showFooterHints, false);
+	await rm(dirname(path), { force: true, recursive: true });
+});
+
 test("test environment is sandboxed and does not touch user agent dir", async () => {
 	const { getAskConfigBaseDir, getTestSandboxDir, isTestEnvironment } =
 		await import("../src/config/store.ts");

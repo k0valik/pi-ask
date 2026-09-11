@@ -1,4 +1,16 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import {
+	access,
+	chmod,
+	lstat,
+	mkdir,
+	open,
+	readFile,
+	rename,
+	rm,
+	writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
@@ -31,6 +43,14 @@ interface AskConfigLoadResult {
 	notice?: AskConfigNotice;
 }
 
+/** Minimal config update. Only the provided slices are merged over disk. */
+export interface AskConfigPatch {
+	answer?: Partial<AskConfig["answer"]>;
+	behaviour?: Partial<AskConfig["behaviour"]>;
+	keymaps?: Partial<AskConfig["keymaps"]>;
+	notifications?: Partial<AskConfig["notifications"]>;
+}
+
 export async function writeJsonFileAtomic(
 	filePath: string,
 	data: unknown
@@ -38,18 +58,70 @@ export async function writeJsonFileAtomic(
 	const content = JSON.stringify(data, null, 2).concat("\n");
 	const dir = dirname(filePath);
 	await mkdir(dir, { recursive: true });
+
+	// Preserve user-managed filesystem shape. A bare rename would silently
+	// replace a read-only file when the directory is writable, and would swap
+	// a symlinked config (dotfiles managers) for a regular file.
+	const existingStat = await lstatSafe(filePath);
+	if (existingStat?.isSymbolicLink()) {
+		await writeFile(filePath, content, "utf-8");
+		return;
+	}
+	if (existingStat) {
+		await access(filePath, constants.W_OK);
+	}
+
 	const tempPath = join(
 		dir,
-		`.${basename(filePath)}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`
+		`.${basename(filePath)}.tmp-${process.pid}-${randomUUID()}`
+	);
+	const handle = await open(
+		tempPath,
+		"wx",
+		existingStat ? toPermissionBits(existingStat.mode) : 0o666
 	);
 	try {
-		await writeFile(tempPath, content, "utf-8");
+		await handle.writeFile(content, "utf-8");
+		await handle.sync();
+		await handle.close();
+	} catch (error) {
+		try {
+			await rm(tempPath, { force: true });
+		} catch {
+			// ignore cleanup error
+		}
+		throw error;
+	}
+	if (existingStat) {
+		try {
+			await chmod(tempPath, toPermissionBits(existingStat.mode));
+		} catch {
+			// Keep umask-derived mode when the original mode cannot be kept.
+		}
+	}
+	try {
 		await rename(tempPath, filePath);
 	} catch (error) {
 		try {
 			await rm(tempPath, { force: true });
 		} catch {
 			// ignore cleanup error
+		}
+		throw error;
+	}
+}
+
+function toPermissionBits(mode: number): number {
+	// Low nine permission bits without tripping the no-bitwise lint rule.
+	return mode % 0o1000;
+}
+
+async function lstatSafe(path: string) {
+	try {
+		return await lstat(path);
+	} catch (error) {
+		if (isMissingFileError(error)) {
+			return;
 		}
 		throw error;
 	}
@@ -95,7 +167,7 @@ export class AskConfigStore {
 		return (await this.ensureLoaded()).config;
 	}
 
-	async save(config: AskConfig | Partial<AskConfig>): Promise<AskConfig> {
+	async save(config: AskConfig | AskConfigPatch): Promise<AskConfig> {
 		try {
 			const rawContent = await this.readDiskConfig();
 			const existing = parseJsonObject(rawContent);
@@ -280,7 +352,7 @@ function getRecord(value: unknown): Record<string, unknown> {
 
 function mergeTopLevelKeys(
 	target: Record<string, unknown>,
-	source: AskConfig | Partial<AskConfig>
+	source: AskConfig | AskConfigPatch
 ): void {
 	for (const [key, value] of Object.entries(source)) {
 		if (
@@ -331,6 +403,14 @@ function mergeNotifications(
 	};
 }
 
+const ASK_KEYMAP_SECTIONS = [
+	"global",
+	"main",
+	"editor",
+	"noteEditor",
+	"settingsModal",
+] as const;
+
 function mergeKeymaps(
 	target: Record<string, unknown>,
 	keymaps?: Partial<AskConfig["keymaps"]>
@@ -339,10 +419,26 @@ function mergeKeymaps(
 		return;
 	}
 	const existing = getRecord(target.keymaps);
-	target.keymaps = {
-		...existing,
-		...keymaps,
-	};
+	const merged: Record<string, unknown> = { ...existing };
+	for (const section of ASK_KEYMAP_SECTIONS) {
+		const sourceSection = keymaps[section];
+		if (sourceSection === undefined) {
+			continue;
+		}
+		merged[section] = {
+			...getRecord(existing[section]),
+			...(sourceSection as Record<string, unknown>),
+		};
+	}
+	for (const [key, value] of Object.entries(keymaps)) {
+		if (
+			value !== undefined &&
+			!(ASK_KEYMAP_SECTIONS as readonly string[]).includes(key)
+		) {
+			merged[key] = value;
+		}
+	}
+	target.keymaps = merged;
 }
 
 function resolveAnswerModels(
@@ -385,14 +481,13 @@ function mergeAnswer(
 
 function mergeConfigFileData(
 	existing: Record<string, unknown>,
-	config: AskConfig | Partial<AskConfig>
+	config: AskConfig | AskConfigPatch
 ): Record<string, unknown> {
 	const data =
 		Object.keys(existing).length === 0
-			? (toAskConfigFileV5(normalizeAskConfig(config)) as Record<
-					string,
-					unknown
-				>)
+			? (toAskConfigFileV5(
+					normalizeAskConfig(config as unknown as Partial<AskConfigFileV5>)
+				) as Record<string, unknown>)
 			: { ...existing };
 
 	data.schemaVersion = Math.max(

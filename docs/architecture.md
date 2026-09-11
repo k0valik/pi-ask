@@ -85,7 +85,9 @@ The codebase is split so the implementation reads through file boundaries and na
 - recovered submit and cancel both persist dismissal before the same call can reopen; manual `/ask:replay` ignores that recovery marker
 - invalid persisted keymaps fall back to default keymaps for the current session without discarding valid behaviour, notification, or answer settings
 - invalid notification channels are skipped and fall back to the default bell channel if none are valid
-- ask settings behaviour and notification enabled changes attempt to persist immediately from the settings list; save failures revert the change and show an error; config reset is guarded by a short double-press confirmation
+- ask settings behaviour and notification enabled changes attempt to persist immediately from the settings list; toggles send single-slice patches so a stale in-memory copy cannot clobber sections edited elsewhere; save failures revert the change and show an error; config reset is guarded by a short double-press confirmation
+- ask config saves merge only the provided slices over the file on disk, preserving unknown top-level keys and nested bindings the schema does not know about
+- ask config saves write atomically via a temp file plus rename, keep the original file mode, write through symlinked configs, and keep refusing read-only files instead of replacing them
 - `presentSingleAsMulti` is applied at ask-flow creation; toggling it does not rewrite already-normalized questions in an open flow
 - `main.changeQuestionType` changes the active question type live (non-preview: `single <-> multi`; preview: `preview <-> multi`) and may require confirmation before destructive multi-to-single conversion
 - when the ask config file is missing, the first ask use attempts to write a default persisted config snapshot under `~/.pi/agent/extensions/`; if writing fails, built-in defaults are used for the session

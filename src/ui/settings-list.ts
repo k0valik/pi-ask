@@ -5,7 +5,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { DEFAULT_ASK_CONFIG, normalizeAskConfig } from "../config/defaults.ts";
 import type { AskConfig } from "../config/schema.ts";
-import type { AskConfigNotice } from "../config/store.ts";
+import type { AskConfigNotice, AskConfigPatch } from "../config/store.ts";
 import {
 	getAskContextBindings,
 	matchesBinding,
@@ -25,7 +25,7 @@ interface AskSettingsListOptions {
 	configPath: string;
 	notice?: AskConfigNotice;
 	onClose: () => void;
-	onSave: (config: AskConfig) => Promise<AskConfig>;
+	onSave: (config: AskConfig | AskConfigPatch) => Promise<AskConfig>;
 	savedConfig: AskConfig;
 	tui: TuiLike;
 }
@@ -124,7 +124,9 @@ export class AskSettingsList {
 	private notice?: AskConfigNotice;
 	private readonly configPath: string;
 	private readonly onClose: () => void;
-	private readonly onSave: (config: AskConfig) => Promise<AskConfig>;
+	private readonly onSave: (
+		config: AskConfig | AskConfigPatch
+	) => Promise<AskConfig>;
 	private readonly theme: Theme;
 	private readonly tui: TuiLike;
 
@@ -384,30 +386,38 @@ export class AskSettingsList {
 	}
 
 	private saveSetting(key: SettingKey, enabled: boolean): void {
-		const nextConfig =
-			key === "notifications.enabled"
-				? {
-						...this.config,
-						notifications: {
-							...this.config.notifications,
-							enabled,
-						},
-					}
-				: {
-						...this.config,
-						behaviour: {
-							...this.config.behaviour,
-							[key]: enabled,
-						},
-					};
-		this.saveConfig(nextConfig);
+		// Send only the toggled slice to the store so a stale in-memory copy
+		// cannot clobber sections edited elsewhere (keymaps, extraction
+		// models, or sibling behaviour flags). The full next config is still
+		// applied optimistically for immediate UI feedback.
+		if (key === "notifications.enabled") {
+			this.saveConfig(
+				{
+					...this.config,
+					notifications: { ...this.config.notifications, enabled },
+				},
+				{ notifications: { enabled } }
+			);
+			return;
+		}
+		const behaviour = { ...this.config.behaviour };
+		behaviour[key] = enabled;
+		const behaviourPatch: Partial<AskConfig["behaviour"]> = {};
+		behaviourPatch[key] = enabled;
+		this.saveConfig(
+			{ ...this.config, behaviour },
+			{ behaviour: behaviourPatch }
+		);
 	}
 
-	private saveConfig(nextConfig: AskConfig): void {
+	private saveConfig(
+		nextConfig: AskConfig,
+		toSave: AskConfig | AskConfigPatch = nextConfig
+	): void {
 		this.error = undefined;
 		const previousConfig = this.config;
 		this.config = nextConfig;
-		this.onSave(nextConfig)
+		this.onSave(toSave)
 			.then((savedConfig) => {
 				this.config = savedConfig;
 				this.notice = undefined;
